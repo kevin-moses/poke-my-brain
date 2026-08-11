@@ -3,7 +3,7 @@
 const MOSH_FRAMES = 120;     // transition length in frames
 const RESOLVE_FRAMES = 8;    // frames at the end spent resolving back to a clean image
 
-const MAX_PANES = 6;         // main perf lever - simultaneous decodes
+const MAX_PANES = 4 ;         // main perf lever - simultaneous decodes
 const PREWARM = 20;          // clips kept decoded ahead of entry - memory buys instant presses
 const WARM_CONCURRENCY = 3;  // clips fetching at once; Chrome only gives ~6 sockets per origin
 const WARM_TIMEOUT = 30;     // seconds a clip gets to become ready before it's recycled
@@ -32,20 +32,21 @@ const RESOLVE_FRAME = MOSH_FRAMES - RESOLVE_FRAMES;      // clean keyframe lands
 // Every pane corrupts at once, and the JPEG round trip is the cost - GLITCH_SCALE and
 // GLITCH_EVERY_IDLE are the dials if the frame rate suffers. A pane is only redrawn when a
 // pass runs, so its apparent frame rate is 60/cadence.
-const GLITCH_BASE = 0.17  ;    // corruption a pane sits at untouched - the master intensity dial
+const GLITCH_BASE = 0.15 ;    // corruption a pane sits at untouched - the master intensity dial
 const GLITCH_EVERY_TOUCHED = 2; // frames between passes on the pane being pressed -> 30fps
-const GLITCH_EVERY_IDLE = 3;    // floor for the others; they roll 3-5 -> 12-20fps
+const GLITCH_EVERY_IDLE = 1 ;    // floor for the others; they roll 3-5 -> 12-20fps
 const GLITCH_SCALE = 0.8;    // buffer size relative to the pane; lower is cheaper, chunkier
-const GLITCH_MIN = 0.07 ;     // below this a pane just draws clean
+const GLITCH_MIN = 0.09  ;     // below this a pane just draws clean
 
 // The metadata column. Text is typed out one character at a time and then stays put - each
-// clip that enters adds its block below the last, so the column reads as a running log of
-// what has played. The only thing that ever clears it is running out of window: a block that
-// would not fit below what is there wipes the column and starts again at the top. EXIF_INDENT
-// matches the label column tools/build-exif.py pads to, so a wrapped value lines up under the
-// one above it.
-const EXIF_WIDTH = 0.2;      // fraction of the canvas width the column occupies
-const EXIF_MARGIN = 16;      // px inset from the top and left edges - the HUD shares the corner
+// clip that enters adds its block below the last, so a section reads as a running log of what
+// has played. A block writes to the very last row it can and then overflows: the remainder
+// carries on at the top of the next section to the right, mid-block, and the typing runs
+// straight through the seam. Past the last section it wraps back to the first, so the section
+// being wiped is always the oldest one on screen. EXIF_INDENT matches the label column
+// tools/build-exif.py pads to, so a wrapped value lines up under the one above it.
+const EXIF_SECTIONS = 3;     // sections the window divides into, filled left to right
+const EXIF_MARGIN = 16;      // px inset from the window edges and inside each section
 const EXIF_SIZE = 12;        // matches the HUD
 const EXIF_LEADING = 16;     // ...as does the line spacing
 const EXIF_INDENT = 9;       // spaces a wrapped line is indented by
@@ -76,10 +77,8 @@ const SILENCE_WARN = 4;      // seconds an open-but-silent port waits before com
 
 let CLIPS = [];              // filenames from assets/manifest.txt
 let EXIF = {};               // filename -> metadata lines, from assets/exif.json
-let exifClips = [];          // clips whose blocks are on screen, oldest first
-let exifLines = [];          // their lines, wrapped to the column and stacked
-let exifTotal = 0;           // characters in exifLines, counting one per line break
-let exifRevealed = 0;        // characters typed so far; fractional between frames
+let exifCols = blankExifCols(); // one per section; see blankExifCols for the shape
+let exifAt = 0;              // section being written to, stepping right and wrapping
 let panes = [];              // draw order: oldest first, newest on top
 let warmPool = [];           // clips loading or loaded, waiting to be handed to a pane
 let deadClips = new Set();   // indices that genuinely failed to load - never tried again
@@ -153,6 +152,10 @@ async function setup() {
 function draw() {
     background(0, 0, 129);
 
+    // Under the panes: the video layers over the text, and a pane moshing in samples the
+    // column along with everything else beneath it, so the type gets dragged by the transition
+    drawExifText();
+
     warmClips();
     checkSerialSilence();
     applyGesture();
@@ -177,10 +180,6 @@ function draw() {
             failPaneEntrance(pane);
         }
     }
-
-    // After the panes, so the column stays legible over them - and so no moshing pane
-    // samples it, since they read the canvas during the loop above
-    drawExifText();
 
     if (showHud) drawHud();
 }
@@ -584,27 +583,63 @@ function drawPaneClean(pane) {
 // ---- the metadata column -------------------------------------------------------
 
 /**
- * Adds a clip's metadata to the bottom of the column, or wipes the column and starts this
- * block at the top when there is no longer room below what is already there. Called as a pane
- * enters, so the column accumulates a block per clip until it runs out of window.
+ * An empty section.
+ *
+ * @return {{clips: string[], lines: string[], revealed: number, total: number}}
+ *   clips    - the filenames stacked in this section, oldest first
+ *   lines    - their blocks wrapped to the section and concatenated
+ *   revealed - characters typed so far, counting one per line break; fractional between frames
+ *   total    - characters in lines, so a section is done when revealed reaches it
+ */
+function blankExifCol() {
+    return { clips: [], lines: [], revealed: 0, total: 0 };
+}
+
+
+/**
+ * One empty section per column of the window.
+ *
+ * @return {Object[]} EXIF_SECTIONS sections, left to right
+ */
+function blankExifCols() {
+    const cols = [];
+    for (let i = 0; i < EXIF_SECTIONS; i++) cols.push(blankExifCol());
+    return cols;
+}
+
+
+/**
+ * Adds a clip's metadata below whatever the current section already holds, filling it to its
+ * last row and spilling the remainder into the next section to the right. Called as a pane
+ * enters, so the sections read as one continuous strip of text that happens to be folded into
+ * columns. Stepping onto a section wipes it, which is the only thing that clears anything.
  *
  * @param {string} name - filename as it appears in the manifest and in exif.json
  */
 function addExifText(name) {
-    const block = wrapExif(EXIF[name] || []);
+    let block = wrapExif(EXIF[name] || []);
     if (!block.length) return;
 
-    if (exifLines.length + block.length > exifRows()) {
-        // Whatever was there has been read by now - this is the only thing that clears it
-        exifClips = [name];
-        exifLines = block.slice(0, exifRows()); // a single block taller than the window is all there is room for
-        exifRevealed = 0;
-    } else {
-        exifClips.push(name);
-        exifLines = exifLines.concat(block); // straight on from the last line, no break between blocks
-        // exifRevealed is left alone, so the typing carries into the new block without pausing
+    const rows = exifRows();
+
+    // A block longer than the whole screen would otherwise chase its own tail forever, wiping
+    // the section it just wrote; the guard stops it after one lap, keeping the last screenful.
+    for (let lap = 0; block.length && lap <= EXIF_SECTIONS; lap++) {
+        const col = exifCols[exifAt];
+        const room = rows - col.lines.length;
+
+        if (room > 0) {
+            col.clips.push(name);
+            col.lines = col.lines.concat(block.slice(0, room)); // no break between blocks
+            col.total = col.lines.reduce((n, line) => n + line.length + 1, 0);
+            // col.revealed is left alone, so typing carries on without pausing
+            block = block.slice(room);
+            if (!block.length) break;
+        }
+
+        exifAt = (exifAt + 1) % EXIF_SECTIONS; // full: the rest goes at the top of the next one
+        exifCols[exifAt] = blankExifCol();
     }
-    exifTotal = exifLines.reduce((n, line) => n + line.length + 1, 0);
 }
 
 
@@ -619,24 +654,43 @@ function exifRows() {
 
 
 /**
- * Re-wraps every block on screen after a resize, since both the column width and the number
- * of rows have moved. Replays the same accumulation, so a narrower window that no longer fits
- * them all drops the older blocks exactly as they would have been dropped live. Everything
- * comes back already typed rather than crawling out again.
+ * Left edge of a section's text.
+ *
+ * @param {number} section - 0-based, left to right
+ * @return {number} x in pixels
  */
-function rebuildExifText() {
-    const names = exifClips;
-    exifClips = [];
-    exifLines = [];
-    exifTotal = 0;
-    for (const name of names) addExifText(name);
-    exifRevealed = exifTotal;
+function exifSectionX(section) {
+    return section * width / EXIF_SECTIONS + EXIF_MARGIN;
 }
 
 
 /**
- * How many monospace characters fit across the column. Measured rather than assumed, since
- * the column is a fraction of the window and the browser picks the actual monospace face.
+ * Re-wraps everything on screen after a resize, since the section width, the line breaks and
+ * the number of rows have all moved. Replays the same accumulation from the oldest section
+ * forward, so a shorter window that no longer fits them all drops the oldest blocks exactly as
+ * they would have been dropped live. Everything comes back already typed rather than crawling
+ * out again.
+ */
+function rebuildExifText() {
+    const names = [];
+    for (const s of exifWriteOrder()) {
+        for (const name of exifCols[s].clips) {
+            // A block spanning a seam is listed by both sections it touches, and replaying it
+            // twice would print it twice
+            if (names[names.length - 1] !== name) names.push(name);
+        }
+    }
+
+    exifCols = blankExifCols();
+    exifAt = 0;
+    for (const name of names) addExifText(name);
+    for (const col of exifCols) col.revealed = col.total;
+}
+
+
+/**
+ * How many monospace characters fit across one section. Measured rather than assumed, since
+ * the sections are a fraction of the window and the browser picks the actual monospace face.
  *
  * @return {number} characters per line, at least 8
  */
@@ -646,7 +700,8 @@ function exifColumns() {
     textSize(EXIF_SIZE);
     const charWidth = textWidth('M');
     pop();
-    return Math.max(8, Math.floor(width * EXIF_WIDTH / charWidth));
+    const usable = width / EXIF_SECTIONS - EXIF_MARGIN * 2; // margin each side keeps a gutter
+    return Math.max(8, Math.floor(usable / charWidth));
 }
 
 
@@ -681,14 +736,35 @@ function wrapExif(lines) {
 
 
 /**
- * Advances and draws the column: reveals characters at EXIF_CPS until the stack is fully
- * typed, then leaves it alone. Timed off deltaTime rather than the frame count, so the reveal
- * keeps its pace while the panes are chewing through frames.
+ * Sections in the order they were written to, oldest first and ending on the one being written
+ * now. Empty sections are included; they simply have nothing to say.
+ *
+ * @return {number[]} section indices
+ */
+function exifWriteOrder() {
+    const order = [];
+    for (let i = 1; i <= EXIF_SECTIONS; i++) order.push((exifAt + i) % EXIF_SECTIONS);
+    return order;
+}
+
+
+/**
+ * Advances and draws every section. One character budget is spent per frame and poured through
+ * the sections in write order, so a block split across a seam finishes the section it started
+ * in and keeps typing straight into the top of the next one, at the same pace. Timed off
+ * deltaTime rather than the frame count, so the reveal holds its pace while the panes are
+ * chewing through frames.
  */
 function drawExifText() {
-    if (!exifLines.length) return;
-
-    exifRevealed = Math.min(exifTotal, exifRevealed + EXIF_CPS * deltaTime / 1000);
+    let budget = EXIF_CPS * deltaTime / 1000;
+    for (const s of exifWriteOrder()) {
+        if (budget <= 0) break;
+        const col = exifCols[s];
+        if (col.revealed >= col.total) continue;
+        const typed = Math.min(budget, col.total - col.revealed);
+        col.revealed += typed;
+        budget -= typed;
+    }
 
     push();
     noStroke();
@@ -697,13 +773,18 @@ function drawExifText() {
     textSize(EXIF_SIZE);
     textAlign(LEFT, TOP);
 
-    const x = EXIF_MARGIN;
-    let budget = Math.floor(exifRevealed);
-    for (let i = 0; i < exifLines.length && budget > 0; i++) {
-        const line = exifLines[i];
-        const shown = line.slice(0, budget);
-        if (shown) text(shown, x, EXIF_MARGIN + i * EXIF_LEADING);
-        budget -= line.length + 1; // the break costs a character, so a blank line still beats
+    for (let s = 0; s < exifCols.length; s++) {
+        const col = exifCols[s];
+        if (!col.lines.length) continue;
+
+        const x = exifSectionX(s);
+        let budget = Math.floor(col.revealed);
+        for (let i = 0; i < col.lines.length && budget > 0; i++) {
+            const line = col.lines[i];
+            const shown = line.slice(0, budget);
+            if (shown) text(shown, x, EXIF_MARGIN + i * EXIF_LEADING);
+            budget -= line.length + 1; // the break costs a character, so a blank line still beats
+        }
     }
     pop();
 }
