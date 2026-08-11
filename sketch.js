@@ -1,6 +1,6 @@
 // ---- tuning ---------------------------------------------------------------------
 
-const MOSH_FRAMES = 180;     // transition length in frames
+const MOSH_FRAMES = 120;     // transition length in frames
 const RESOLVE_FRAMES = 8;    // frames at the end spent resolving back to a clean image
 
 const MAX_PANES = 6;         // main perf lever - simultaneous decodes
@@ -32,25 +32,54 @@ const RESOLVE_FRAME = MOSH_FRAMES - RESOLVE_FRAMES;      // clean keyframe lands
 // Every pane corrupts at once, and the JPEG round trip is the cost - GLITCH_SCALE and
 // GLITCH_EVERY_IDLE are the dials if the frame rate suffers. A pane is only redrawn when a
 // pass runs, so its apparent frame rate is 60/cadence.
-const GLITCH_BASE = 0.4;     // corruption a pane sits at untouched
-const GLITCH_EVERY = 2;      // frames between passes on the pane being touched -> 30fps
-const GLITCH_EVERY_IDLE = 3; // ...and on the ones that are not -> 20fps
-const GLITCH_SCALE = 0.6;    // buffer size relative to the pane; lower is cheaper, chunkier
-const GLITCH_MIN = 0.02;     // below this a pane just draws clean
-const GLITCH_BYTES = 140;    // bytes randomised at full corruption, before the pane's bias
+const GLITCH_BASE = 0.17  ;    // corruption a pane sits at untouched - the master intensity dial
+const GLITCH_EVERY_TOUCHED = 2; // frames between passes on the pane being pressed -> 30fps
+const GLITCH_EVERY_IDLE = 3;    // floor for the others; they roll 3-5 -> 12-20fps
+const GLITCH_SCALE = 0.8;    // buffer size relative to the pane; lower is cheaper, chunkier
+const GLITCH_MIN = 0.07 ;     // below this a pane just draws clean
 
-// Two FSRs on an Arduino, sending "fsr0,fsr1" a line at a time over WebSerial. Both squeezed
-// moshes a clip in; one alone rubs the corruption out of a pane, harder press meaning cleaner.
+// The metadata column. Text is typed out one character at a time and then stays put - each
+// clip that enters adds its block below the last, so the column reads as a running log of
+// what has played. The only thing that ever clears it is running out of window: a block that
+// would not fit below what is there wipes the column and starts again at the top. EXIF_INDENT
+// matches the label column tools/build-exif.py pads to, so a wrapped value lines up under the
+// one above it.
+const EXIF_WIDTH = 0.2;      // fraction of the canvas width the column occupies
+const EXIF_MARGIN = 16;      // px inset from the top and left edges - the HUD shares the corner
+const EXIF_SIZE = 12;        // matches the HUD
+const EXIF_LEADING = 16;     // ...as does the line spacing
+const EXIF_INDENT = 9;       // spaces a wrapped line is indented by
+const EXIF_CPS = 2000;        // characters revealed per second
+
+// Either half of the rig can be the board on the wire, and they narrate differently, so both
+// are parsed: the sensor board sends a numeric CSV line per sample, while the HeadbandMassager
+// peripheral has no sensors of its own and only echoes the BLE writes it receives, one line
+// per channel ("rx ch0: 45"). Both channels pressed moshes a clip in; one alone rubs the
+// corruption out of a pane, harder press meaning cleaner.
 const SERIAL_BAUD = 9600;    // must match the Arduino's Serial.begin()
-const FSR_MAX = 120;         // the sketch maps its 12-bit reads to 0..120, not 0..127
+const FSR_MAX = 120;         // the board maps its 12-bit reads to 0..120, not 0..127
+// The sensor board sends "raw0,raw1,level0,level1,flag". The raw fields are 12-bit ADC counts
+// and the level fields are those mapped to 0..FSR_MAX - which is the range every threshold
+// here is tuned against, so the levels are what get read. Correct these two if the column
+// order changes.
+const CSV_CH0 = 2;           // column holding channel 0's mapped level
+const CSV_CH1 = 3;           // ...and channel 1's
 const ACTIVE_THRESHOLD = 10; // above this a sensor counts as touched
-const UNGLITCH_AT = 60;      // press this hard and the targeted pane is clean for good
-const GESTURE_SETTLE = 150;  // ms a lone sensor waits for its partner; must beat the 100ms send interval
+const UNGLITCH_AT = 30;      // press this hard and the targeted pane is clean for good
+// The channels arrive as two separate lines now rather than one snapshot, so a squeeze
+// genuinely lands as two events. This window is what stops the first of them flashing a
+// glitch on the way into every squeeze.
+const GESTURE_SETTLE = 150;  // ms a lone sensor waits for its partner; 0 disables
 const SILENCE_WARN = 4;      // seconds an open-but-silent port waits before complaining
 
 // ---- state ----------------------------------------------------------------------
 
 let CLIPS = [];              // filenames from assets/manifest.txt
+let EXIF = {};               // filename -> metadata lines, from assets/exif.json
+let exifClips = [];          // clips whose blocks are on screen, oldest first
+let exifLines = [];          // their lines, wrapped to the column and stacked
+let exifTotal = 0;           // characters in exifLines, counting one per line break
+let exifRevealed = 0;        // characters typed so far; fractional between frames
 let panes = [];              // draw order: oldest first, newest on top
 let warmPool = [];           // clips loading or loaded, waiting to be handed to a pane
 let deadClips = new Set();   // indices that genuinely failed to load - never tried again
@@ -67,9 +96,10 @@ let fsr = [0, 0];            // latest reading per channel
 let fsrSince = [0, 0];       // millis() each channel crossed ACTIVE_THRESHOLD
 let bothWasActive = false;   // so a held squeeze is one gesture rather than sixty
 let bothLatched = false;     // suppresses single-sensor glitching until both are released
-let linesSeen = 0;           // serial lines parsed, for the HUD and the first-line log
-let badLines = 0;            // unparseable ones
-let lastLineAt = 0;          // last parseable reading
+let linesSeen = 0;           // readings parsed, for the HUD and the first-reading log
+let badLines = 0;            // non-reading lines: boot banner, I2C scan, heartbeats, HALTED
+let lastLineAt = 0;          // last parsed reading
+let lastAnyAt = 0;           // last line of any kind, so a talking board still counts as alive
 let silenceWarned = false;
 let loggedChannel = -1;      // glitch channel last reported, so logging stays on transitions
 
@@ -105,6 +135,14 @@ async function setup() {
         .filter(Boolean);
     if (!CLIPS.length) console.warn('[clips] assets/manifest.txt is empty - run tools/build-manifest.sh');
     else logEvent('clips', CLIPS.length, 'in the manifest; warming up to', PREWARM);
+
+    // Optional: a clip with no entry simply enters without a metadata block
+    try {
+        EXIF = await loadJSON('assets/exif.json');
+        logEvent('exif', Object.keys(EXIF).length, 'clips have metadata');
+    } catch (e) {
+        console.warn('[exif] could not read assets/exif.json - run tools/build-exif.py');
+    }
 }
 
 
@@ -113,7 +151,7 @@ async function setup() {
  * state it is in - moshing, glitching, or clean.
  */
 function draw() {
-    background(0);
+    background(0, 0, 129);
 
     warmClips();
     checkSerialSilence();
@@ -139,6 +177,10 @@ function draw() {
             failPaneEntrance(pane);
         }
     }
+
+    // After the panes, so the column stays legible over them - and so no moshing pane
+    // samples it, since they read the canvas during the loop above
+    drawExifText();
 
     if (showHud) drawHud();
 }
@@ -305,7 +347,7 @@ function setupSerial() {
     // open() resolves either way, so the port is only genuinely open once this fires
     serial.on('open', () => {
         portState = 'open';
-        lastLineAt = millis();
+        lastLineAt = lastAnyAt = millis();
         silenceWarned = false;
         logEvent('serial', 'port open at', SERIAL_BAUD, 'baud - waiting for lines');
     });
@@ -389,8 +431,11 @@ function makePortButton() {
 }
 
 
+// One BLE write, echoed by the peripheral: "rx ch0: 45"
+const RX_LINE = /^rx ch([01]):\s*(\d+)$/;
+
 /**
- * Handles one incoming serial line, latching "fsr0,fsr1" into the fsr pair. Parsing is the
+ * Handles one incoming serial line, latching any reading into the fsr pair. Parsing is the
  * only per-line work, so a burst between frames costs nothing beyond the last one winning.
  */
 function serialEvent() {
@@ -399,46 +444,74 @@ function serialEvent() {
     line = line.trim();
     if (!line) return;
 
-    const parts = line.split(',');
-    const values = parts.map((s) => int(s));
-    if (parts.length !== 2 || values.some((v) => !isFinite(v))) {
-        // Usually the board narrating its BLE state on the same wire, not garbage. Mangled
-        // characters here would mean a baud mismatch instead.
-        badLines++;
-        logEvent('arduino', line);
+    lastAnyAt = millis();
+
+    const rx = line.match(RX_LINE);
+    if (rx) {
+        applyReading(Number(rx[1]), Number(rx[2]));
         return;
     }
 
-    lastLineAt = millis();
-    if (linesSeen++ === 0) logEvent('serial', 'first line parsed:', line, '- data is flowing');
-
-    for (let ch = 0; ch < 2; ch++) {
-        // Stamp the moment a channel wakes up, so GESTURE_SETTLE has something to measure
-        if (values[ch] > ACTIVE_THRESHOLD && fsr[ch] <= ACTIVE_THRESHOLD) fsrSince[ch] = millis();
-        fsr[ch] = values[ch];
+    // A numeric CSV line from the sensor board. The current firmware sends five columns and
+    // keeps the mapped levels in the middle; an older one sent just the two levels.
+    const parts = line.split(',');
+    const values = parts.map((s) => int(s));
+    if (parts.length >= 2 && values.every((v) => isFinite(v))) {
+        const wide = parts.length > CSV_CH1;
+        applyReading(0, values[wide ? CSV_CH0 : 0]);
+        applyReading(1, values[wide ? CSV_CH1 : 1]);
+        return;
     }
+
+    // Everything else is the board narrating itself - boot banner, I2C scan, heartbeats,
+    // HALTED codes. Mangled characters here would mean a baud mismatch instead.
+    badLines++;
+    logEvent('arduino', line);
 }
 
 
 /**
- * Warns once when an open port has gone quiet for SILENCE_WARN seconds. Nothing errors in
- * that case - the sketch simply never reacts - and whether anything at all is arriving is
- * what tells the two causes apart.
+ * Latches one channel's level and stamps the moment it crosses into being touched, which is
+ * what GESTURE_SETTLE measures against.
+ *
+ * @param {number} ch - 0 or 1
+ * @param {number} value - level as written over BLE
+ */
+function applyReading(ch, value) {
+    if (value > ACTIVE_THRESHOLD && fsr[ch] <= ACTIVE_THRESHOLD) fsrSince[ch] = millis();
+    fsr[ch] = value;
+
+    lastLineAt = millis();
+    if (linesSeen++ === 0) logEvent('serial', 'first reading parsed: ch' + ch, '=', value,
+                                   '- data is flowing');
+}
+
+
+/**
+ * Warns once when an open port isn't delivering. Nothing errors in that case - the sketch
+ * simply never reacts. The board heartbeats every 2s whether or not anyone is pressing, so
+ * total silence and "alive but no readings" are genuinely different faults with different
+ * fixes, and are reported separately.
  */
 function checkSerialSilence() {
     if (portState !== 'open' || silenceWarned) return;
-    if (millis() - lastLineAt < SILENCE_WARN * 1000) return;
+
+    const now = millis();
+    const dead = now - lastAnyAt > SILENCE_WARN * 1000;
+    const noReadings = !dead && linesSeen === 0 && now - lastLineAt > SILENCE_WARN * 1000;
+    if (!dead && !noReadings) return;
     silenceWarned = true;
 
-    if (linesSeen === 0 && badLines === 0) {
-        console.warn(`[serial] port open but completely silent for ${SILENCE_WARN}s.` +
-                     ' Wrong port (Bluetooth-Incoming-Port?), wrong baud, or the board is' +
-                     ' not running. Reload to pick a different port.');
+    if (dead) {
+        console.warn(`[serial] port open but completely silent for ${SILENCE_WARN}s -` +
+                     ' not even a heartbeat. Wrong port (Bluetooth-Incoming-Port?), wrong' +
+                     ' baud, or the board is not running. Reload to pick a different port.');
     } else {
-        console.warn(`[serial] the board is talking but has sent no readings for` +
-                     ` ${SILENCE_WARN}s. It only prints "fsr0,fsr1" once it has connected` +
-                     ' to the HeadbandMassager peripheral - see the [arduino] lines above.' +
-                     ' Until then the space bar still moshes clips in.');
+        console.warn(`[serial] the board is talking but no "rx ch0:" / "rx ch1:" lines have` +
+                     ` arrived in ${SILENCE_WARN}s. The peripheral only prints those when a` +
+                     ' BLE central writes to it, so either nothing is connected and writing,' +
+                     ' or no sensor has been pressed yet - see the [arduino] lines above.' +
+                     ' The space bar still moshes clips in either way.');
     }
 }
 
@@ -481,15 +554,13 @@ function drawHud() {
             : '-'),
         // Raw values, not just the verdict - this is what ACTIVE_THRESHOLD is tuned against
         'fsr ' + fsr[0] + ',' + fsr[1] + '  port ' + portState,
-        'lines ' + linesSeen + (badLines ? '  bad ' + badLines : '') +
+        'rx ' + linesSeen + (badLines ? '  msg ' + badLines : '') +
             (portState === 'open' ? '  last ' + nf((millis() - lastLineAt) / 1000, 1, 1) + 's' : ''),
         'gesture ' + gestureLabel(),
     ];
 
     push();
     noStroke();
-    fill(0, 200);
-    rect(8, 8, 230, lines.length * 16 + 12);
     fill(255);
     textFont('monospace');
     textSize(12);
@@ -507,6 +578,134 @@ function drawHud() {
  */
 function drawPaneClean(pane) {
     drawingContext.drawImage(pane.video.elt, pane.x, pane.y, pane.w, pane.h);
+}
+
+
+// ---- the metadata column -------------------------------------------------------
+
+/**
+ * Adds a clip's metadata to the bottom of the column, or wipes the column and starts this
+ * block at the top when there is no longer room below what is already there. Called as a pane
+ * enters, so the column accumulates a block per clip until it runs out of window.
+ *
+ * @param {string} name - filename as it appears in the manifest and in exif.json
+ */
+function addExifText(name) {
+    const block = wrapExif(EXIF[name] || []);
+    if (!block.length) return;
+
+    if (exifLines.length + block.length > exifRows()) {
+        // Whatever was there has been read by now - this is the only thing that clears it
+        exifClips = [name];
+        exifLines = block.slice(0, exifRows()); // a single block taller than the window is all there is room for
+        exifRevealed = 0;
+    } else {
+        exifClips.push(name);
+        exifLines = exifLines.concat(block); // straight on from the last line, no break between blocks
+        // exifRevealed is left alone, so the typing carries into the new block without pausing
+    }
+    exifTotal = exifLines.reduce((n, line) => n + line.length + 1, 0);
+}
+
+
+/**
+ * How many lines fit between the top and bottom margins.
+ *
+ * @return {number} rows available, at least 1
+ */
+function exifRows() {
+    return Math.max(1, Math.floor((height - EXIF_MARGIN * 2) / EXIF_LEADING));
+}
+
+
+/**
+ * Re-wraps every block on screen after a resize, since both the column width and the number
+ * of rows have moved. Replays the same accumulation, so a narrower window that no longer fits
+ * them all drops the older blocks exactly as they would have been dropped live. Everything
+ * comes back already typed rather than crawling out again.
+ */
+function rebuildExifText() {
+    const names = exifClips;
+    exifClips = [];
+    exifLines = [];
+    exifTotal = 0;
+    for (const name of names) addExifText(name);
+    exifRevealed = exifTotal;
+}
+
+
+/**
+ * How many monospace characters fit across the column. Measured rather than assumed, since
+ * the column is a fraction of the window and the browser picks the actual monospace face.
+ *
+ * @return {number} characters per line, at least 8
+ */
+function exifColumns() {
+    push();
+    textFont('monospace');
+    textSize(EXIF_SIZE);
+    const charWidth = textWidth('M');
+    pop();
+    return Math.max(8, Math.floor(width * EXIF_WIDTH / charWidth));
+}
+
+
+/**
+ * Wraps one clip's metadata to the column, breaking at spaces where it can and mid-token when
+ * a value has none. Every line is kept, however long the block runs; whether it fits is
+ * addExifText's question, not this one's.
+ *
+ * @param {string[]} lines - one clip's lines from exif.json
+ * @return {string[]} lines that each fit the column
+ */
+function wrapExif(lines) {
+    const cols = exifColumns();
+    // Only indent continuations when there is room left to say anything after the indent
+    const indent = cols > EXIF_INDENT + 8 ? ' '.repeat(EXIF_INDENT) : '';
+
+    const out = [];
+    for (const raw of lines) {
+        let line = raw;
+        let prefix = '';
+        while (line.length > cols) {
+            let cut = line.lastIndexOf(' ', cols);
+            if (cut <= prefix.length) cut = cols; // one long token: break it anywhere
+            out.push(line.slice(0, cut));
+            prefix = indent;
+            line = prefix + line.slice(cut).trimStart();
+        }
+        out.push(line);
+    }
+    return out;
+}
+
+
+/**
+ * Advances and draws the column: reveals characters at EXIF_CPS until the stack is fully
+ * typed, then leaves it alone. Timed off deltaTime rather than the frame count, so the reveal
+ * keeps its pace while the panes are chewing through frames.
+ */
+function drawExifText() {
+    if (!exifLines.length) return;
+
+    exifRevealed = Math.min(exifTotal, exifRevealed + EXIF_CPS * deltaTime / 1000);
+
+    push();
+    noStroke();
+    fill(255);
+    textFont('monospace');
+    textSize(EXIF_SIZE);
+    textAlign(LEFT, TOP);
+
+    const x = EXIF_MARGIN;
+    let budget = Math.floor(exifRevealed);
+    for (let i = 0; i < exifLines.length && budget > 0; i++) {
+        const line = exifLines[i];
+        const shown = line.slice(0, budget);
+        if (shown) text(shown, x, EXIF_MARGIN + i * EXIF_LEADING);
+        budget -= line.length + 1; // the break costs a character, so a blank line still beats
+    }
+    pop();
 }
 
 
@@ -690,8 +889,9 @@ function tryEnterPane() {
         glitch: null, glitchBuffer: null,
         glitchAmount: GLITCH_BASE,          // corrupts as soon as the mosh hands over
         unglitched: false,                  // latched clean by a hard press; never re-arms
-        glitchOffset: panes.length % GLITCH_EVERY_IDLE, // stagger passes across panes
+        glitchOffset: panes.length,         // stagger passes across panes
         glitchStyle: rollGlitchStyle(),     // this clip's own flavour of corruption
+        displaceAt: rollDisplaceAt(),       // depth of the shear; re-rolled as it runs
     };
 
     // Without WebCodecs there is nothing to mosh with, so the pane just appears
@@ -702,6 +902,7 @@ function tryEnterPane() {
 
     panes.push(pane);
     pendingEntry = false; // from here the pane's own phase holds the key shut
+    addExifText(CLIPS[pane.clipIndex]);
 
     const style = pane.glitchStyle;
     logEvent('pane', 'entered', CLIPS[pane.clipIndex],
@@ -710,7 +911,7 @@ function tryEnterPane() {
         pane.phase === 'MOSHING' ? '- moshing in' : '- no codec, appearing clean',
         `(${panes.length}/${MAX_PANES} panes)`,
         `| glitch q${nf(style.quality, 1, 2)} start${nf(style.start, 1, 2)}` +
-        ` x${nf(style.bytes, 1, 2)} ${style.solid === undefined ? 'static' : 'band' + style.solid}` +
+        ` ${Math.round(style.bytes)}b ${style.solid === undefined ? 'static' : 'band' + style.solid}` +
         ` every ${style.cadence}`);
 }
 
@@ -906,23 +1107,37 @@ function runMoshFrame(pane) {
  * way twice and no two panes on screen corrupt alike.
  *
  * @return {{quality: number, start: number, bytes: number, solid: (number|undefined),
- *           cadence: number}}
+ *           cadence: number, displaceEvery: number}}
  *   quality - JPEG quality, so damage lands in fat blocks or fine grain
  *   start   - how deep into the file corruption may reach at full strength; low numbers sit
  *             near the header and take the whole frame's colour and structure with them
- *   bytes   - how much damage, against the shared GLITCH_BYTES budget
+ *   bytes   - this pane's own byte budget at full corruption, scaled down by its level
  *   solid   - the replacement byte; a fixed value is steady banding, undefined re-rolls each
  *             pass and flickers (p5.glitch reuses one value for every byte in a pass)
  *   cadence - how frantic the churn is when the pane is left alone
+ *   displaceEvery - frames the shear holds its depth before jumping to a new one
  */
 function rollGlitchStyle() {
     return {
-        quality: random(0.35, 0.95),
-        start: random(0.04, 0.30),
-        bytes: random(0.5, 1.8),
-        solid: random() < 0.35 ? Math.floor(random(256)) : undefined,
+        quality: random(0.6, 0.95),
+        start: random(0.15, 0.40),
+        bytes: random(70, 250),
+        solid: random() < 0.2 ? Math.floor(random(256)) : undefined,
         cadence: Math.floor(random(GLITCH_EVERY_IDLE, GLITCH_EVERY_IDLE + 3)),
+        displaceEvery: Math.floor(random(40, 100)),
     };
+}
+
+
+/**
+ * Picks how deep into the JPEG the shear byte lands, as a fraction of the file. Kept inside
+ * the scan data: below this a hit can land in the quantisation or Huffman tables, which makes
+ * the frame undecodable rather than displaced, and the pane just falls back to clean.
+ *
+ * @return {number} 0..1 position in the file
+ */
+function rollDisplaceAt() {
+    return random(0.15, 0.95);
 }
 
 
@@ -953,8 +1168,9 @@ function ensureGlitch(pane) {
 
 /**
  * Draws one glitched frame of a pane by corrupting the clip's own JPEG bytes, as far as the
- * pane's current level asks for. Only re-corrupts on the pane's cadence, so the pane being
- * touched refreshes fastest and per-pane offsets keep the passes from landing together.
+ * pane's current level asks for. Two kinds of damage land per pass: a single shear byte that
+ * displaces the frame, and the speckle band. Only re-corrupts on the pane's cadence, so the
+ * pane being touched refreshes fastest and per-pane offsets keep passes from landing together.
  *
  * @param {Object} pane
  */
@@ -962,16 +1178,29 @@ function runGlitchFrame(pane) {
     ensureGlitch(pane);
 
     const style = pane.glitchStyle;
-    const cadence = pane.glitchAmount < GLITCH_BASE ? GLITCH_EVERY : style.cadence;
+
+    // Holding the depth steady is the whole effect. Corrupting one byte desyncs the entropy
+    // decode from that point down, so the same depth every pass shifts the frame the same way
+    // and reads as displacement - a fresh depth each pass would just read as noise.
+    if (frameCount % style.displaceEvery === 0) pane.displaceAt = rollDisplaceAt();
+
+    const cadence = pane.glitchAmount < GLITCH_BASE ? GLITCH_EVERY_TOUCHED : style.cadence;
     if ((frameCount + pane.glitchOffset) % cadence === 0) {
         const buf = pane.glitchBuffer;
         buf.drawingContext.drawImage(pane.video.elt, 0, 0, buf.width, buf.height);
         pane.glitch.loadImage(buf);
         pane.glitch.resetBytes();
+
+        // randomByte takes an absolute position and ignores the limits set below, so this is
+        // the only damage that can land above the speckle band - which is what lets the shear
+        // sit anywhere in the frame while the speckle stays pinned to the bottom.
+        const len = pane.glitch.bytesGlitched.length;
+        if (len) pane.glitch.randomByte(Math.floor(pane.displaceAt * len));
+
         // Must come before randomBytes - it defines the range that draws from. Corrupting
         // earlier in the file is more destructive, so more corruption lowers the start.
         pane.glitch.limitBytes(map(pane.glitchAmount, 0, 1, 1.0, style.start));
-        const bytes = Math.floor(pane.glitchAmount * GLITCH_BYTES * style.bytes);
+        const bytes = Math.floor(pane.glitchAmount * style.bytes);
         pane.glitch.randomBytes(bytes, style.solid);
         pane.glitch.buildImage(); // async; pane.glitch.image lands a frame or two later
     }
@@ -1164,6 +1393,11 @@ function triWave(p) {
  */
 function windowResized() {
     resizeCanvas(windowWidth, windowHeight);
+
+    // The column is sized off the window, so both its line breaks and the rows it has to
+    // fill in have moved
+    rebuildExifText();
+
     for (const pane of panes) {
         pane.x = constrain(pane.x, -pane.w * BLEED, width - pane.w * (1 - BLEED));
         pane.y = constrain(pane.y, -pane.h * BLEED, height - pane.h * (1 - BLEED));
